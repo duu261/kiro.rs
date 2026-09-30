@@ -183,6 +183,56 @@ async fn call_remote_count_tokens(
     Ok(result.input_tokens as u64)
 }
 
+/// 本地计算消息 content 的 tokens（字符串或 block 数组）。
+///
+/// 覆盖 text / thinking / tool_use.input / tool_result.content（字符串或嵌套 block）/
+/// image 以及其他未知 block（按序列化 JSON 计）。仅数 `text` 字段会让 agentic
+/// 会话（以 tool_result 为主）的输入被严重低估。
+fn count_content_tokens(content: &serde_json::Value) -> u64 {
+    match content {
+        serde_json::Value::String(s) => count_tokens(s),
+        serde_json::Value::Array(arr) => arr.iter().map(count_block_tokens).sum(),
+        serde_json::Value::Null => 0,
+        other => count_tokens(&other.to_string()),
+    }
+}
+
+fn count_block_tokens(block: &serde_json::Value) -> u64 {
+    let str_field = |key: &str| block.get(key).and_then(|v| v.as_str());
+    match block.get("type").and_then(|v| v.as_str()) {
+        Some("text") => str_field("text").map(count_tokens).unwrap_or(0),
+        Some("thinking") => str_field("thinking").map(count_tokens).unwrap_or(0),
+        Some("redacted_thinking") => 8,
+        Some("tool_use") => {
+            let input = block
+                .get("input")
+                .map(|v| serde_json::to_string(v).unwrap_or_default())
+                .unwrap_or_default();
+            str_field("name").map(count_tokens).unwrap_or(0) + count_tokens(&input)
+        }
+        Some("tool_result") => block
+            .get("content")
+            .map(count_content_tokens)
+            .unwrap_or(0),
+        Some("image") => {
+            let src = block.get("source");
+            let media_type = src
+                .and_then(|s| s.get("media_type"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let data = src
+                .and_then(|s| s.get("data"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            crate::image_resize::estimate_image_tokens(media_type, data) as u64
+        }
+        _ => match str_field("text") {
+            Some(text) => count_tokens(text),
+            None => count_tokens(&serde_json::to_string(block).unwrap_or_default()),
+        },
+    }
+}
+
 /// 本地计算请求的输入 tokens
 fn count_all_tokens_local(
     system: Option<Vec<SystemMessage>>,
@@ -200,15 +250,7 @@ fn count_all_tokens_local(
 
     // 用户消息
     for msg in &messages {
-        if let serde_json::Value::String(s) = &msg.content {
-            total += count_tokens(s);
-        } else if let serde_json::Value::Array(arr) = &msg.content {
-            for item in arr {
-                if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
-                    total += count_tokens(text);
-                }
-            }
-        }
+        total += count_content_tokens(&msg.content);
     }
 
     // 工具定义
@@ -277,5 +319,73 @@ mod tests {
         })]);
 
         assert!(tokens >= 8);
+    }
+
+    fn msg(role: &str, content: serde_json::Value) -> Message {
+        Message {
+            role: role.to_string(),
+            content,
+        }
+    }
+
+    #[test]
+    fn local_input_counts_tool_result_and_tool_use() {
+        let big = "x".repeat(40_000);
+        let text_only = count_all_tokens_local(
+            None,
+            vec![msg("user", json!([{ "type": "text", "text": "run ls" }]))],
+            None,
+        );
+        let agentic = count_all_tokens_local(
+            None,
+            vec![
+                msg("user", json!([{ "type": "text", "text": "run ls" }])),
+                msg(
+                    "assistant",
+                    json!([{ "type": "tool_use", "id": "t1", "name": "shell",
+                             "input": { "cmd": big.clone() } }]),
+                ),
+                msg(
+                    "user",
+                    json!([{ "type": "tool_result", "tool_use_id": "t1", "content": big.clone() }]),
+                ),
+                msg(
+                    "user",
+                    json!([{ "type": "tool_result", "tool_use_id": "t2",
+                             "content": [{ "type": "text", "text": big.clone() }] }]),
+                ),
+            ],
+            None,
+        );
+        // 3 × 40k chars ≈ 30k tokens；旧实现只数 text 字段，约等于 text_only。
+        assert!(agentic >= text_only + 29_000, "agentic={agentic} text_only={text_only}");
+    }
+
+    #[test]
+    fn local_input_grows_with_tool_output() {
+        let turn = |n: usize| {
+            count_all_tokens_local(
+                None,
+                vec![msg(
+                    "user",
+                    json!([{ "type": "tool_result", "tool_use_id": "t", "content": "y".repeat(n) }]),
+                )],
+                None,
+            )
+        };
+        assert!(turn(80_000) > turn(8_000) * 5);
+    }
+
+    #[test]
+    fn local_input_counts_thinking() {
+        let with_thinking = count_all_tokens_local(
+            None,
+            vec![msg(
+                "assistant",
+                json!([{ "type": "thinking", "thinking": "z".repeat(4_000), "signature": "s" }]),
+            )],
+            None,
+        );
+        assert!(with_thinking >= 900);
     }
 }
