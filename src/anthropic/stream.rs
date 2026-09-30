@@ -1452,6 +1452,11 @@ impl StreamContext {
     ///
     /// 精确 `metadataEvent.tokenUsage` 优先；只有上游未提供该事件时，才按
     /// contextUsage/请求估算总量与本地 CacheMeter 比例回退。
+    ///
+    /// When the local simulation covered a prefix, the split uses the local
+    /// request estimate (`input_tokens`, the same total sent in `message_start`)
+    /// instead of Kiro's contextUsage, which undercounts tools/system. This keeps
+    /// `message_start` and `message_delta` usage identical.
     pub fn resolved_usage(&self) -> (i32, i32, i32) {
         if let Some(usage) = self.provider_token_usage {
             let usage = usage.sanitized();
@@ -1462,7 +1467,11 @@ impl StreamContext {
             );
         }
 
-        let total_real = self.context_input_tokens.unwrap_or(self.input_tokens);
+        let total_real = if self.cache_usage.is_simulated() {
+            self.input_tokens
+        } else {
+            self.context_input_tokens.unwrap_or(self.input_tokens)
+        };
         self.cache_usage.split_against_total(total_real)
     }
 
@@ -1523,7 +1532,17 @@ impl StreamContext {
     }
 
     /// 生成 message_start 事件
+    ///
+    /// With a simulated cache hit the final split is already known here (it is
+    /// based on the local estimate), so report it up front. Clients that keep
+    /// `message_start` input when `message_delta` input is 0 then bill the same
+    /// numbers as clients that read `message_delta`.
     pub fn create_message_start_event(&self) -> serde_json::Value {
+        let (input_tokens, cache_creation, cache_read) = if self.cache_usage.is_simulated() {
+            self.cache_usage.split_against_total(self.input_tokens)
+        } else {
+            (self.input_tokens, 0, 0)
+        };
         json!({
             "type": "message_start",
             "message": {
@@ -1535,10 +1554,10 @@ impl StreamContext {
                 "stop_reason": null,
                 "stop_sequence": null,
                 "usage": {
-                    "input_tokens": self.input_tokens,
+                    "input_tokens": input_tokens,
                     "output_tokens": 1,
-                    "cache_creation_input_tokens": 0,
-                    "cache_read_input_tokens": 0
+                    "cache_creation_input_tokens": cache_creation,
+                    "cache_read_input_tokens": cache_read
                 }
             }
         })
@@ -5475,8 +5494,71 @@ mod tests {
             prompt_total_est: 100,
         };
 
-        assert_eq!(ctx.resolved_usage(), (40, 20, 20));
+        // Simulated cache splits against the local estimate (100), not contextUsage (80).
+        assert_eq!(ctx.resolved_usage(), (50, 25, 25));
         assert_eq!(ctx.resolved_output_tokens(), 9);
+
+        // Without simulation, contextUsage stays the total.
+        ctx.cache_usage = CacheUsage::default();
+        assert_eq!(ctx.resolved_usage(), (80, 0, 0));
+    }
+
+    /// Regression: kiro-rs reported message_start input = local estimate with
+    /// zero cache, then message_delta input = 0 with cache split against the much
+    /// smaller contextUsage. Clients that keep message_start input when the delta
+    /// input is 0 (New API) billed the full estimate plus cache on top.
+    #[test]
+    fn simulated_cache_start_and_delta_usage_match() {
+        use crate::anthropic::cache_metering::CacheUsage;
+
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-sonnet-5",
+            24_152,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        // Kiro contextUsage far below the local estimate, as observed in production.
+        ctx.context_input_tokens = Some(3_807);
+        // Full prefix hit except a short tail.
+        ctx.cache_usage = CacheUsage {
+            cache_read: 24_000,
+            cache_covered_est: 24_000,
+            prompt_total_est: 24_152,
+        };
+
+        let start = ctx.create_message_start_event();
+        let usage = &start["message"]["usage"];
+        let start_split = (
+            usage["input_tokens"].as_i64().unwrap() as i32,
+            usage["cache_creation_input_tokens"].as_i64().unwrap() as i32,
+            usage["cache_read_input_tokens"].as_i64().unwrap() as i32,
+        );
+
+        let final_split = ctx.resolved_usage();
+        assert_eq!(start_split, final_split, "message_start and message_delta must agree");
+
+        let (input, creation, read) = final_split;
+        assert_eq!(input + creation + read, 24_152, "split must cover the whole estimate");
+        assert_eq!(read, 21_736, "cache_read capped at 90% of the prompt");
+        assert_eq!(input, 2_416);
+        assert!(input > 0, "delta input must stay > 0 so clients take the final split");
+    }
+
+    #[test]
+    fn no_simulation_keeps_estimate_in_message_start() {
+        let ctx = StreamContext::new_with_thinking(
+            "claude-sonnet-5",
+            5_000,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let start = ctx.create_message_start_event();
+        let usage = &start["message"]["usage"];
+        assert_eq!(usage["input_tokens"], 5_000);
+        assert_eq!(usage["cache_creation_input_tokens"], 0);
+        assert_eq!(usage["cache_read_input_tokens"], 0);
     }
 
     #[test]

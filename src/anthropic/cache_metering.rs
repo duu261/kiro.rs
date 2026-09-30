@@ -84,17 +84,69 @@ pub struct CacheUsage {
     pub prompt_total_est: i32,
 }
 
+/// Default cap on the share of the prompt reported as `cache_read`.
+pub const DEFAULT_MAX_READ_RATIO: f64 = 0.9;
+
+/// Parse a max-read-ratio value. Accepts a fraction in `[0, 1]`; anything else
+/// (empty, non-numeric, NaN, out of range) returns `None`.
+fn parse_max_read_ratio(raw: &str) -> Option<f64> {
+    let value: f64 = raw.trim().parse().ok()?;
+    (value.is_finite() && (0.0..=1.0).contains(&value)).then_some(value)
+}
+
+/// Process-wide cap on the `cache_read` share of the prompt, from
+/// `KIRO_RS_CACHE_MAX_READ_RATIO` (fraction, default 0.9). Read once.
+pub fn max_read_ratio() -> f64 {
+    static RATIO: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *RATIO.get_or_init(|| {
+        match std::env::var("KIRO_RS_CACHE_MAX_READ_RATIO") {
+            Ok(raw) if !raw.trim().is_empty() => parse_max_read_ratio(&raw).unwrap_or_else(|| {
+                tracing::warn!(
+                    "KIRO_RS_CACHE_MAX_READ_RATIO={:?} is not a fraction in [0, 1]; using {}",
+                    raw,
+                    DEFAULT_MAX_READ_RATIO
+                );
+                DEFAULT_MAX_READ_RATIO
+            }),
+            _ => DEFAULT_MAX_READ_RATIO,
+        }
+    })
+}
+
 impl CacheUsage {
+    /// Whether the local simulation covered any prefix for this request.
+    pub fn is_simulated(&self) -> bool {
+        self.cache_covered_est > 0 && self.prompt_total_est > 0
+    }
+
     /// 按真实 total 口径把 prompt 拆成三个互斥的部分，返回
     /// `(input_tokens, cache_creation, cache_read)`，相加严格 == `total_real`。
     ///
+    /// `cache_read` is capped at `max_read_ratio()` of the total; the excess is
+    /// reported as uncached input (never as creation), so the three parts still
+    /// sum to `total_real`.
+    pub fn split_against_total(&self, total_real: i32) -> (i32, i32, i32) {
+        self.split_against_total_capped(total_real, max_read_ratio())
+    }
+
+    /// Same as [`Self::split_against_total`] with an explicit read cap.
+    pub fn split_against_total_capped(&self, total_real: i32, max_read_ratio: f64) -> (i32, i32, i32) {
+        let (input, creation, read) = self.split_uncapped(total_real);
+        let total = input + creation + read;
+        let cap = ((total as f64) * max_read_ratio.clamp(0.0, 1.0)).floor() as i32;
+        if read <= cap {
+            return (input, creation, read);
+        }
+        (input + (read - cap), creation, cap)
+    }
+
     /// 语义与 Anthropic 官方 usage 字段一致，不做任何计费向的再加工：
     /// - `cache_read`：命中此前写入过的最长前缀（本次无需重新处理的部分）
     /// - `cache_creation`：被断点覆盖但未命中、本次新写入缓存的部分
     /// - `input_tokens`：最深断点之后未被缓存覆盖的尾部
     ///
     /// estimate 口径与真实 total 口径的尺度差异通过无量纲比例分摊消除。
-    pub fn split_against_total(&self, total_real: i32) -> (i32, i32, i32) {
+    fn split_uncapped(&self, total_real: i32) -> (i32, i32, i32) {
         let total = total_real.max(0);
         if self.cache_covered_est <= 0 || self.prompt_total_est <= 0 {
             return (total, 0, 0);
@@ -1355,11 +1407,17 @@ mod tests {
         // 第二次：相同请求 → 命中
         let u2 = compute_cache_usage_sync(&cache, &req, 1);
         assert!(u2.cache_read > 0, "second call should hit");
-        let (in2, cc2, cr2) = u2.split_against_total(total);
+        let (in2, cc2, cr2) = u2.split_against_total_capped(total, 1.0);
         assert_eq!(cc2, 0, "second call creation should be 0, got {}", cc2);
         assert!(cr2 > 0, "second call read>0, cr={}", cr2);
         assert_eq!(in2 + cc2 + cr2, total, "互斥口径必须自洽");
-        assert_eq!(cc1, cr2);
+        assert_eq!(cc1, cr2, "uncapped: second call reads back what the first wrote");
+
+        // With the default 90% cap the read is limited and the excess becomes input.
+        let (in3, cc3, cr3) = u2.split_against_total_capped(total, 0.9);
+        assert_eq!(in3 + cc3 + cr3, total, "capped split must still sum to total");
+        assert!(cr3 <= total * 9 / 10, "read {} exceeds 90% of {}", cr3, total);
+        assert_eq!(cc3, 0);
     }
 
     #[test]
@@ -3167,7 +3225,7 @@ mod tests {
         assert_eq!((input, creation, read), (12_345, 0, 0));
     }
 
-    /// 全量命中的长对话：命中前缀原样上报为 cache_read，只有最新提问计入 input。
+    /// 全量命中的长对话：命中前缀上报为 cache_read，但不超过 90% 上限；超出部分计入 input。
     #[test]
     fn test_full_prefix_hit_reports_true_cache_read() {
         // 场景：历史前缀命中 100,000 tokens，最新提问 1,000 tokens，总计 101,000 tokens
@@ -3177,10 +3235,45 @@ mod tests {
             prompt_total_est: 101_000,
         };
 
-        let (input, creation, read) = usage.split_against_total(101_000);
+        let (input, creation, read) = usage.split_against_total_capped(101_000, 0.9);
         assert_eq!(input + creation + read, 101_000, "三项严格互斥守恒");
-        assert_eq!(read, 100_000, "命中前缀必须全额如实上报");
+        assert_eq!(read, 90_900, "cache_read capped at 90%");
         assert_eq!(creation, 0, "无新增覆盖段");
-        assert_eq!(input, 1_000, "最新提问如实计入 input");
+        assert_eq!(input, 10_100, "latest turn plus capped excess counted as input");
+
+        // Cap of 1.0 keeps the old uncapped behaviour.
+        let (input, creation, read) = usage.split_against_total_capped(101_000, 1.0);
+        assert_eq!((input, creation, read), (1_000, 0, 100_000));
+    }
+
+    #[test]
+    fn read_cap_leaves_creation_and_small_hits_untouched() {
+        // First turn: everything covered is creation; the cap only limits reads.
+        let first = CacheUsage {
+            cache_read: 0,
+            cache_covered_est: 99,
+            prompt_total_est: 100,
+        };
+        assert_eq!(first.split_against_total_capped(1_000, 0.9), (10, 990, 0));
+
+        // A hit below the cap is reported unchanged.
+        let partial = CacheUsage {
+            cache_read: 50,
+            cache_covered_est: 80,
+            prompt_total_est: 100,
+        };
+        assert_eq!(partial.split_against_total_capped(1_000, 0.9), (200, 300, 500));
+    }
+
+    #[test]
+    fn parse_max_read_ratio_accepts_fractions_only() {
+        assert_eq!(parse_max_read_ratio("0.9"), Some(0.9));
+        assert_eq!(parse_max_read_ratio(" 0.85 "), Some(0.85));
+        assert_eq!(parse_max_read_ratio("0"), Some(0.0));
+        assert_eq!(parse_max_read_ratio("1"), Some(1.0));
+        assert_eq!(parse_max_read_ratio("90"), None);
+        assert_eq!(parse_max_read_ratio("-0.1"), None);
+        assert_eq!(parse_max_read_ratio("NaN"), None);
+        assert_eq!(parse_max_read_ratio("abc"), None);
     }
 }

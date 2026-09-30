@@ -489,7 +489,13 @@ fn resolve_non_stream_usage(
         );
     }
 
-    let total_input = context_total_input_tokens.unwrap_or(fallback_total_input_tokens);
+    let total_input = if cache_usage.is_simulated() {
+        // Simulated cache: split against the local estimate, not contextUsage
+        // (see StreamContext::resolved_usage).
+        fallback_total_input_tokens
+    } else {
+        context_total_input_tokens.unwrap_or(fallback_total_input_tokens)
+    };
     let (input, cache_write, cache_read) = cache_usage.split_against_total(total_input);
     (
         input,
@@ -2692,7 +2698,13 @@ mod tests {
 
         assert_eq!(
             resolve_non_stream_usage(100, Some(80), 9, cache_usage, None),
-            (40, 9, 20, 20)
+            (50, 9, 25, 25),
+            "simulated cache splits against the local estimate, not contextUsage"
+        );
+        assert_eq!(
+            resolve_non_stream_usage(100, Some(80), 9, Default::default(), None),
+            (80, 9, 0, 0),
+            "without simulation contextUsage stays the total"
         );
         assert_eq!(
             resolve_non_stream_usage(100, None, -9, Default::default(), None),
